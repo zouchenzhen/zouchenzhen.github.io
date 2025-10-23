@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0b0d" />
+  <title>Love Board · Triple Heartbeat + LongPress</title>
+  <style>
+    html, body {
+      height: 100%; margin: 0; background:#0b0b0d; color:#fff; overflow: hidden;
+      font-family: system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",
+        "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Arial,
+        "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif;
+    }
+    #stage {
+      position: fixed; inset:0; width:100%; height:100%; display:block;
+      touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+    }
+    .hint { position:fixed; left:12px; bottom:12px; font-size:12px; color:#a4a4aa; opacity:.75; user-select:none; pointer-events:none;}
+  </style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+  <div class="hint">点击/触摸：心形爆裂；长按：连续多层心形爆裂</div>
+
+  <script>
+  ;(() => {
+    /** ================= 个性化配置 ================= */
+    const CONFIG = {
+      loverName: "💗 邹邹与韩韩 一周年快乐 我们天下第一好 永远在一起 💗",
+      bgColor: "#0b0b0d",
+
+      // 飘动文字（减半字号 + 速度+50% + 防重叠）
+      textCount: 22,
+      textScales: [0.9, 1.0, 1.15],
+      speed: 15,
+      rotMax: 0.06,
+      alphaRange: [0.55, 0.85],
+      minDistanceFactor: 0.75,
+      textColor: "#ffd1e2",
+
+      // 中心三层大爱心（由小爱心拼成）
+      bigHeart: {
+        baseScaleFactor: 0.010,
+        freq: 1.05,     // 心跳频率
+        ampHi: 0.14,    // 大跳振幅
+        ampLo: 0.06,    // 小跳振幅
+        layers: [
+          { scale: 0.86, count: 150, alpha: 0.75 },
+          { scale: 1.00, count: 220, alpha: 0.92 },
+          { scale: 1.16, count: 180, alpha: 0.60 }
+        ],
+        dotSizeMin: 10,
+        dotSizeMax: 16,
+        colors: ["#ff6ea6","#ff7fb0","#ff96bf","#ffc3d6"]
+      },
+
+      // 触摸/点击爆裂（心形轨迹）
+      burst: {
+        count: 90,            // 单轮采样数量
+        velocity: 56,         // 初速度
+        life: 1.4,            // 粒子寿命
+        scaleFactor: 0.003,   // 迷你心形相对屏幕短边比例
+        jitter: 2.0,          // 位置抖动
+        // 长按连发
+        longpressIntervalMs: 120,  // 每次喷发间隔
+        longpressLayers: 3,        // 每次喷发叠加多少层（递增缩放）
+        layerScaleStep: 0.18       // 相邻层缩放增量（相对 scaleFactor）
+      }
+    };
+
+    /** ================= 画布 & DPR 适配 ================= */
+    const canvas = document.getElementById('stage');
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+    function fitCanvas() {
+      const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2.5));
+      const rect = canvas.getBoundingClientRect();
+      const w = Math.floor(rect.width);
+      const h = Math.floor(rect.height);
+      canvas.width  = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      // 字体基准：短边 3%（“减半字号”）
+      const basePx = Math.round(Math.max(28, Math.min(50, Math.min(w, h) * 0.03)));
+      return { w, h, dpr, basePx };
+    }
+    let view = fitCanvas();
+    window.addEventListener('resize', () => {
+      view = fitCanvas(); buildTextAtlases();
+      sprites.forEach(s=>s.reset(view.w, view.h, true));
+      buildHeartSprites();
+      buildHeartFields();
+    }, { passive: true });
+
+    /** ================= 工具函数 ================= */
+    const rnd=(a,b)=>Math.random()*(b-a)+a;
+    const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+
+    /** ================= 小爱心贴图 ================= */
+    function makeHeartSprite(sizePx, color) {
+      const s = Math.max(6, sizePx|0);
+      const off = document.createElement('canvas');
+      off.width = off.height = s;
+      const c = off.getContext('2d');
+      c.fillStyle = color;
+      c.translate(s/2, s/2);
+      const r = s/2;
+      c.beginPath();
+      c.moveTo(0, r*0.45);
+      c.bezierCurveTo(r, r*1.1,  r*1.6, -r*0.2,  0, -r*0.55);
+      c.bezierCurveTo(-r*1.6, -r*0.2, -r, r*1.1, 0, r*0.45);
+      c.closePath();
+      c.fill();
+      return off;
+    }
+
+    let HEART_SPRITES = [];
+    function buildHeartSprites() {
+      HEART_SPRITES = [];
+      for (const col of CONFIG.bigHeart.colors) {
+        for (let sz = CONFIG.bigHeart.dotSizeMin; sz <= CONFIG.bigHeart.dotSizeMax; sz += 2) {
+          HEART_SPRITES.push(makeHeartSprite(sz, col));
+        }
+      }
+    }
+    buildHeartSprites();
+
+    /** ================= 文本贴图缓存（atlas） ================= */
+    let TEXT_ATLASES = [];
+    function buildTextAtlases() {
+      TEXT_ATLASES = CONFIG.textScales.map(scale => {
+        const fontPx = Math.round(view.basePx * scale);
+        const tmp = document.createElement('canvas');
+        const tctx = tmp.getContext('2d');
+        const text = CONFIG.loverName;
+        tctx.font = `${fontPx}px "Microsoft YaHei","Noto Sans CJK SC",sans-serif`;
+        const m = tctx.measureText(text);
+        tmp.width = Math.ceil(m.width) + 8;
+        tmp.height = Math.ceil(fontPx * 1.2);
+        const octx = tmp.getContext('2d');
+        octx.font = `${fontPx}px "Microsoft YaHei","Noto Sans CJK SC",sans-serif`;
+        octx.textBaseline = 'middle';
+        octx.fillStyle = CONFIG.textColor;
+        octx.fillText(text, 0, tmp.height / 2);
+        return { canvas: tmp, w: tmp.width, h: tmp.height, fontPx };
+      });
+    }
+    buildTextAtlases();
+
+    /** ================= 心形参数方程（朝上） ================= */
+    function heartPoint(t, scale) {
+      const x = 16 * Math.pow(Math.sin(t), 3);
+      const y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+      return { x: x * scale, y: -y * scale };
+    }
+
+    /** ================= 三层心形“点场” ================= */
+    let HEART_FIELDS = []; // [ [dots...], [dots...], [dots...] ]
+    function buildLayerField(count) {
+      const arr = [];
+      for (let i=0;i<count;i++){
+        const t = Math.random() * Math.PI * 2;
+        const inner = rnd(0.55, 1.0);
+        const jitter = rnd(-1.2, 1.2);
+        const sprite = HEART_SPRITES[(Math.random()*HEART_SPRITES.length)|0];
+        const phase = Math.random() * Math.PI * 2;
+        arr.push({ t, inner, jitter, sprite, phase, rot: rnd(-0.35,0.35) });
+      }
+      return arr;
+    }
+    function buildHeartFields() {
+      HEART_FIELDS = CONFIG.bigHeart.layers.map(l => buildLayerField(l.count));
+    }
+    buildHeartFields();
+
+    /** ================= 飘动文字（防重叠） ================= */
+    class Sprite {
+      constructor(w,h){ this.reset(w,h,true); }
+      reset(w,h,randomY=false){
+        const idx = (Math.random()*TEXT_ATLASES.length)|0;
+        this.atlasIdx = idx;
+        const a = TEXT_ATLASES[idx];
+        this.x = rnd(0, w);
+        this.y = randomY ? rnd(0, h) : -a.h;
+        this.vx = rnd(-CONFIG.speed*0.6, CONFIG.speed*0.6);
+        this.vy = rnd(CONFIG.speed*0.6,  CONFIG.speed*1.0);
+        this.rot = rnd(-0.08, 0.08);
+        this.spin = rnd(-CONFIG.rotMax, CONFIG.rotMax);
+        this.alpha = rnd(CONFIG.alphaRange[0], CONFIG.alphaRange[1]);
+      }
+      bounds(){ const a = TEXT_ATLASES[this.atlasIdx]; return { w:a.w, h:a.h }; }
+      update(dt,w,h){
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.rot += this.spin * dt;
+        if (this.y > h + 40 || this.x < -400 || this.x > w + 400) {
+          this.reset(w, h, false);
+        }
+      }
+      draw(ctx){
+        const a = TEXT_ATLASES[this.atlasIdx];
+        ctx.save();
+        ctx.globalAlpha = this.alpha;
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rot);
+        ctx.drawImage(a.canvas, -a.w/2, -a.h/2);
+        ctx.restore();
+      }
+    }
+
+    function applySeparation(sprites, w, h, blockCX, blockCY, blockR) {
+      const k = 0.015;
+      // 1) 互相轻推
+      for (let i=0;i<sprites.length;i++){
+        const si = sprites[i], bi = si.bounds();
+        for (let j=i+1;j<sprites.length;j++){
+          const sj = sprites[j], bj = sj.bounds();
+          const dx = sj.x - si.x, dy = sj.y - si.y;
+          const dist = Math.hypot(dx,dy)||0.0001;
+          const minD = (bi.h*CONFIG.minDistanceFactor + bj.h*CONFIG.minDistanceFactor)*0.5;
+          if (dist < minD){
+            const overlap = (minD - dist);
+            const ux = dx/dist, uy = dy/dist;
+            si.x -= ux * overlap * k; si.y -= uy * overlap * k;
+            sj.x += ux * overlap * k; sj.y += uy * overlap * k;
+          }
+        }
+      }
+      // 2) 对中心三层心形的包围圈留空
+      for (const s of sprites){
+        const dx = s.x - blockCX, dy = s.y - blockCY;
+        const d = Math.hypot(dx, dy) || 0.0001;
+        if (d < blockR){
+          const ux = dx / d, uy = dy / d;
+          const offset = (blockR - d) * 0.08;
+          s.x += ux * offset; s.y += uy * offset;
+        }
+      }
+      // 3) 轻度边界限制
+      for (const s of sprites){
+        s.x = clamp(s.x, -300, w+300);
+        s.y = clamp(s.y, -300, h+300);
+      }
+    }
+
+    /** ================= 点击/触摸：心形爆裂（单次 & 长按连发） ================= */
+    let bursts = []; // {x,y,vx,vy,life,maxLife,rot,sprite}
+    let isPressing = false;
+    let pressTimer = null;
+    let lastPos = { x: 0, y: 0 };
+    let loopPhase = 0; // 用于连发时的层级相位变化
+
+    function spawnBurstHeart(x, y, layerScaleMul = 1, phaseBias = 0) {
+      const base = Math.min(view.w, view.h) * CONFIG.burst.scaleFactor * layerScaleMul;
+      for (let i = 0; i < CONFIG.burst.count; i++) {
+        const t = Math.random() * Math.PI * 2 + phaseBias; // 加相位偏移，让每轮有细微区别
+        const pt = heartPoint(t, base);
+        const px = x + pt.x + rnd(-CONFIG.burst.jitter, CONFIG.burst.jitter);
+        const py = y + pt.y + rnd(-CONFIG.burst.jitter, CONFIG.burst.jitter);
+
+        // 切向与径向的混合，像是沿心形炸开
+        const dir = Math.atan2(pt.y, pt.x) + Math.PI/2;
+        const radial = Math.atan2(pt.y, pt.x);
+        const mix = 0.55;
+        const ang = dir * mix + radial * (1 - mix);
+
+        const sp = rnd(CONFIG.burst.velocity * 0.85, CONFIG.burst.velocity * 1.15);
+        const sprite = HEART_SPRITES[(Math.random()*HEART_SPRITES.length)|0];
+
+        bursts.push({
+          x: px, y: py,
+          vx: Math.cos(ang) * sp,
+          vy: Math.sin(ang) * sp,
+          life: rnd(CONFIG.burst.life*0.8, CONFIG.burst.life*1.2),
+          maxLife: CONFIG.burst.life,
+          rot: rnd(-0.7, 0.7),
+          sprite
+        });
+      }
+    }
+
+    // 长按一轮：叠加多层不同半径的小心形
+    function spawnBurstHeartMulti(x, y) {
+      loopPhase += 0.9; // 让每轮有旋转/相位变化
+      for (let i = 0; i < CONFIG.burst.longpressLayers; i++) {
+        const mul = 1 + i * CONFIG.burst.layerScaleStep;     // 逐层变大
+        const bias = loopPhase + i * Math.PI * 0.33;         // 分层相位错开
+        spawnBurstHeart(x, y, mul, bias);
+      }
+    }
+
+    function startPressLoop() {
+      if (pressTimer) return;
+      pressTimer = setInterval(() => {
+        spawnBurstHeartMulti(lastPos.x, lastPos.y);
+      }, CONFIG.burst.longpressIntervalMs);
+    }
+    function stopPressLoop() {
+      if (pressTimer) { clearInterval(pressTimer); pressTimer = null; }
+    }
+
+    // 事件：点击/触摸
+    function canvasXY(e){
+      const r=canvas.getBoundingClientRect();
+      let x,y; if(e.touches&&e.touches[0]){ x=e.touches[0].clientX-r.left; y=e.touches[0].clientY-r.top; }
+      else { x=e.clientX-r.left; y=e.clientY-r.top; }
+      return {x,y};
+    }
+
+    // 单次点击
+    function handleSingleBurst(e){
+      const {x,y} = canvasXY(e);
+      spawnBurstHeart(x,y);
+    }
+
+    // 长按逻辑（鼠标）
+    canvas.addEventListener('mousedown', (e)=> {
+      isPressing = true;
+      lastPos = canvasXY(e);
+      // 立即来一发，手感更好
+      spawnBurstHeartMulti(lastPos.x, lastPos.y);
+      startPressLoop();
+    }, { passive: true });
+    window.addEventListener('mousemove', (e)=> {
+      if (!isPressing) return;
+      lastPos = canvasXY(e);
+    }, { passive: true });
+    window.addEventListener('mouseup', ()=> { isPressing = false; stopPressLoop(); }, { passive: true });
+    canvas.addEventListener('mouseleave', ()=> { isPressing = false; stopPressLoop(); }, { passive: true });
+
+    // 触摸：tap 单发 + 长按连发（跟手）
+    let touchPressTimeout = null;
+    canvas.addEventListener('touchstart', (e)=> {
+      lastPos = canvasXY(e);
+      isPressing = true;
+      // 立即来一发
+      spawnBurstHeartMulti(lastPos.x, lastPos.y);
+      startPressLoop();
+      // 若你想“短点为单发、长按才连发”，可使用延迟：
+      // touchPressTimeout = setTimeout(startPressLoop, 150);
+    }, { passive: true });
+    canvas.addEventListener('touchmove', (e)=> {
+      if (!isPressing) return;
+      lastPos = canvasXY(e);
+    }, { passive: true });
+    canvas.addEventListener('touchend', ()=> {
+      isPressing = false;
+      stopPressLoop();
+      if (touchPressTimeout) { clearTimeout(touchPressTimeout); touchPressTimeout = null; }
+    }, { passive: true });
+    canvas.addEventListener('touchcancel', ()=> {
+      isPressing = false;
+      stopPressLoop();
+      if (touchPressTimeout) { clearTimeout(touchPressTimeout); touchPressTimeout = null; }
+    }, { passive: true });
+
+    // 仍保留“点击一次立刻单发”的体验（不想保留可删除下面这行）
+    canvas.addEventListener('click', handleSingleBurst, { passive: true });
+
+    /** ================= 小爱心爆裂的更新/绘制 ================= */
+    function updateBursts(dt) {
+      const floatUp = -0.35; // 轻微向上漂
+      for (let i=bursts.length-1;i>=0;i--){
+        const b = bursts[i];
+        b.life -= dt;
+        if (b.life <= 0) { bursts.splice(i,1); continue; }
+        b.vy += floatUp * dt; // 上浮
+        b.x  += b.vx * dt;
+        b.y  += b.vy * dt;
+      }
+    }
+    function drawBursts(ctx){
+      for (const b of bursts){
+        const a = clamp(b.life / b.maxLife, 0, 1);
+        ctx.save();
+        ctx.globalAlpha = a * 0.95;
+        ctx.translate(b.x, b.y);
+        ctx.rotate(b.rot);
+        ctx.drawImage(b.sprite, -b.sprite.width/2, -b.sprite.height/2);
+        ctx.restore();
+      }
+    }
+
+    /** ================= 初始化：文字精灵 ================= */
+    let sprites = Array.from({ length: CONFIG.textCount }, ()=>new Sprite(view.w, view.h));
+
+    /** ================= 主循环（单 RAF） ================= */
+    let last = performance.now();
+    function frame(now){
+      const dt = clamp((now-last)/1000, 0, 0.05); last = now;
+      const w=view.w, h=view.h;
+      ctx.fillStyle = CONFIG.bgColor; ctx.fillRect(0,0,w,h);
+
+      const t = now / 1000;
+      const cx = w/2, cy = h/2;
+
+      // —— 大小交替的心跳 —— //
+      const beatPhase = t * Math.PI * 2 * CONFIG.bigHeart.freq; // 主心跳相位
+      const mod = 0.5 * (1 + Math.sin(beatPhase * 0.5));        // 0..1
+      const amp = CONFIG.bigHeart.ampLo + (CONFIG.bigHeart.ampHi - CONFIG.bigHeart.ampLo) * mod;
+      const baseScale = Math.min(w,h) * CONFIG.bigHeart.baseScaleFactor;
+      const heartScaleBase = baseScale * (1 + amp * Math.sin(beatPhase));
+
+      // —— 三层小爱心拼图 —— //
+      for (let li = 0; li < CONFIG.bigHeart.layers.length; li++) {
+        const layer = CONFIG.bigHeart.layers[li];
+        const dots = HEART_FIELDS[li];
+        const layerScale = heartScaleBase * layer.scale;
+        ctx.globalAlpha = layer.alpha;
+        for (const dot of dots) {
+          const edge = heartPoint(dot.t, layerScale);
+          const px = cx + edge.x * dot.inner + dot.jitter;
+          const py = cy + edge.y * dot.inner + dot.jitter;
+          ctx.save();
+          ctx.translate(px, py);
+          ctx.rotate(dot.rot + Math.sin(t + dot.phase) * 0.04);
+          ctx.drawImage(dot.sprite, -dot.sprite.width/2, -dot.sprite.height/2);
+          ctx.restore();
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      // —— 心形爆裂（单发/连发） —— //
+      updateBursts(dt);
+      drawBursts(ctx);
+
+      // —— 飘动文字（更新→分离→绘制），对中心留空 —— //
+      const blockR = heartScaleBase * Math.max(...CONFIG.bigHeart.layers.map(l => l.scale)) * 19;
+      for (const s of sprites) s.update(dt,w,h);
+      applySeparation(sprites, w, h, cx, cy, blockR);
+      for (const s of sprites) s.draw(ctx);
+
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(t=>{ last=t; frame(t); });
+  })();
+  </script>
+</body>
+</html>
